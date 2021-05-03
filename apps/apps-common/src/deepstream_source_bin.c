@@ -95,7 +95,7 @@ create_camera_source_bin (NvDsSourceConfig * config, NvDsSrcBin * bin)
     NVGSTDS_ERR_MSG_V ("Could not create 'src_cap_filter'");
     goto done;
   }
-  caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING, "NV12",
+  caps = gst_caps_new_simple ("image/jpeg",
       "width", G_TYPE_INT, config->source_width, "height", G_TYPE_INT,
       config->source_height, "framerate", GST_TYPE_FRACTION,
       config->source_fps_n, config->source_fps_d, NULL);
@@ -108,21 +108,26 @@ create_camera_source_bin (NvDsSourceConfig * config, NvDsSrcBin * bin)
 
   //g_object_set (G_OBJECT (bin->cap_filter), "caps", caps, NULL);
   if (config->type == NV_DS_SOURCE_CAMERA_V4L2) {
-    GstElement *nvvidconv1, *nvvidconv2;
+    GstElement *jpg_dec, *nvvidconv1, *nvvidconv2;
     GstCapsFeatures *feature = NULL;
-
+	
+    jpg_dec = gst_element_factory_make ("jpegdec", "jpeg-decoder");
+    if(!jpg_dec) {
+	    NVGSTDS_ERR_MSG_V("Failed to create 'jpg_dec'");
+	    goto done;
+    }
 
     nvvidconv1 = gst_element_factory_make ("videoconvert", "nvvidconv1");
     if (!nvvidconv1) {
       NVGSTDS_ERR_MSG_V ("Failed to create 'nvvidconv1'");
       goto done;
     }
-
+	GstCaps *lnvcaps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING,"NV12","width", G_TYPE_INT, config->source_width, "height", G_TYPE_INT, config->source_height, "framerate", GST_TYPE_FRACTION, config->source_fps_n, config->source_fps_d, NULL);
     feature = gst_caps_features_new ("memory:NVMM", NULL);
-    gst_caps_set_features (caps, 0, feature);
-    g_object_set (G_OBJECT (bin->cap_filter), "caps", caps, NULL);
+    gst_caps_set_features (lnvcaps, 0, feature);
+    g_object_set (G_OBJECT (bin->cap_filter), "caps", lnvcaps, NULL);
 
-    nvvidconv2 = gst_element_factory_make (NVDS_ELEM_VIDEO_CONV, "nvvidconv2");
+    nvvidconv2 = gst_element_factory_make ("nvvideoconvert", "nvvidconv2");
     if (!nvvidconv2) {
       NVGSTDS_ERR_MSG_V ("Failed to create 'nvvidconv2'");
       goto done;
@@ -131,11 +136,11 @@ create_camera_source_bin (NvDsSourceConfig * config, NvDsSrcBin * bin)
     g_object_set (G_OBJECT (nvvidconv2), "gpu-id", config->gpu_id,
         "nvbuf-memory-type", config->nvbuf_memory_type, NULL);
 
-    gst_bin_add_many (GST_BIN (bin->bin), bin->src_elem, bin->cap_filter,
-        nvvidconv1, nvvidconv2, bin->cap_filter,
+    gst_bin_add_many (GST_BIN (bin->bin), bin->src_elem, jpg_dec, nvvidconv1, nvvidconv2, bin->cap_filter,
         NULL);
+    gst_element_link_filtered(bin->src_elem, jpg_dec, caps);
 
-    NVGSTDS_LINK_ELEMENT (bin->src_elem, nvvidconv1);
+    NVGSTDS_LINK_ELEMENT (jpg_dec, nvvidconv1);
 
     NVGSTDS_LINK_ELEMENT (nvvidconv1, nvvidconv2);
 
@@ -404,56 +409,15 @@ cb_newpad3 (GstElement * decodebin, GstPad * pad, gpointer data)
   }
 }
 
-/* Returning FALSE from this callback will make rtspsrc ignore the stream.
- * Ignore audio and add the proper depay element based on codec. */
+/* Select only video stream. Ignore other streams. */
 static gboolean
 cb_rtspsrc_select_stream (GstElement *rtspsrc, guint num, GstCaps *caps,
         gpointer user_data)
 {
   GstStructure *str = gst_caps_get_structure (caps, 0);
   const gchar *media = gst_structure_get_string (str, "media");
-  const gchar *encoding_name = gst_structure_get_string (str, "encoding-name");
-  gchar elem_name[50];
-  NvDsSrcBin *bin = (NvDsSrcBin *) user_data;
-  gboolean ret = FALSE;
 
-  gboolean is_video = (!g_strcmp0 (media, "video"));
-
-  if (!is_video)
-    return FALSE;
-
-  /* Create and add depay element only if it is not created yet. */
-  if (!bin->depay) {
-    g_snprintf (elem_name, sizeof (elem_name), "depay_elem%d", bin->bin_id);
-
-    /* Add the proper depay element based on codec. */
-    if (!g_strcmp0 (encoding_name, "H264")) {
-      bin->depay = gst_element_factory_make ("rtph264depay", elem_name);
-    } else if (!g_strcmp0 (encoding_name, "H265")) {
-      bin->depay = gst_element_factory_make ("rtph265depay", elem_name);
-    } else {
-      NVGSTDS_WARN_MSG_V ("%s not supported", encoding_name);
-      return FALSE;
-    }
-
-    if (!bin->depay) {
-      NVGSTDS_ERR_MSG_V ("Failed to create '%s'", elem_name);
-      return FALSE;
-    }
-
-    gst_bin_add (GST_BIN (bin->bin), bin->depay);
-
-    NVGSTDS_LINK_ELEMENT (bin->depay, bin->dec_que);
-
-    if (!gst_element_sync_state_with_parent (bin->depay)) {
-      NVGSTDS_ERR_MSG_V ("'%s' failed to sync state with parent", elem_name);
-      return FALSE;
-    }
-  }
-
-  ret = TRUE;
-done:
-  return ret;
+  return !g_strcmp0 (media, "video");
 }
 
 static gboolean
@@ -500,6 +464,13 @@ create_rtsp_src_bin (NvDsSourceConfig * config, NvDsSrcBin * bin)
   g_signal_connect (G_OBJECT (bin->src_elem), "pad-added",
       G_CALLBACK (cb_newpad3), bin);
 
+  g_snprintf (elem_name, sizeof (elem_name), "depay_elem%d", bin->bin_id);
+  bin->depay = gst_element_factory_make ("rtph264depay", elem_name);
+  if (!bin->depay) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", elem_name);
+    goto done;
+  }
+
   g_snprintf (elem_name, sizeof (elem_name), "dec_que%d", bin->bin_id);
   bin->dec_que = gst_element_factory_make ("queue", elem_name);
   if (!bin->dec_que) {
@@ -533,14 +504,16 @@ create_rtsp_src_bin (NvDsSourceConfig * config, NvDsSrcBin * bin)
       g_print ("Failed to create dewarper bin \n");
       goto done;
     }
-    gst_bin_add_many (GST_BIN (bin->bin), bin->src_elem,
+    gst_bin_add_many (GST_BIN (bin->bin), bin->src_elem, bin->depay,
         bin->dec_que,
         bin->decodebin, bin->dewarper_bin.bin, bin->cap_filter, NULL);
   } else {
-    gst_bin_add_many (GST_BIN (bin->bin), bin->src_elem,
+    gst_bin_add_many (GST_BIN (bin->bin), bin->src_elem, bin->depay,
         bin->dec_que, bin->decodebin, bin->cap_filter, NULL);
   }
 
+
+  NVGSTDS_LINK_ELEMENT (bin->depay, bin->dec_que);
   NVGSTDS_LINK_ELEMENT (bin->dec_que, bin->decodebin);
 
   if (config->dewarper_config.enable) {
@@ -841,8 +814,7 @@ deepstream_rtp_bin_handle_sync (GstElement * jitterbuffer, GstStructure * s,
   guint64 sr_ext_rtptime = g_value_get_uint64 (gst_structure_get_value(s, "sr-ext-rtptime"));
   guint clock_rate = g_value_get_uint (gst_structure_get_value(s, "clock-rate"));
 
-  gstreamer_time += gst_util_uint64_scale (sr_ext_rtptime - base_rtptime,
-          GST_SECOND, clock_rate);
+  gstreamer_time += ((sr_ext_rtptime - base_rtptime) * GST_SECOND / clock_rate);
   GstRTCPBuffer rtcp = { NULL, };
   NvDsSrcBin *dsSrcBin = (NvDsSrcBin*)user_data;
 
@@ -922,9 +894,6 @@ rtp_bin_new_jitter_buffer (GstBin  *rtpbin,
   g_signal_connect(G_OBJECT(jitterbuffer), "handle-sync",
                    G_CALLBACK(deepstream_rtp_bin_handle_sync),
                    user_data);
-  /* Allow RTCP SR reports to be infinitely ahead than the data stream. This is
-   * useful for very low fps streams. */
-  g_object_set (G_OBJECT (jitterbuffer), "max-rtcp-rtp-time-diff", -1, NULL);
 }
 
 void cb_rtsp_src_elem_added(GstBin     *bin,
